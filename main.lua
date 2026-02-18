@@ -138,43 +138,174 @@ local function btDisconnect(address)
 end
 
 -- ── Reconnect strategies ─────────────────────────────────────────────────────
+--
+-- Each strategy is a different set of D-Bus / syscall operations used to
+-- restore a paired device connection after deep sleep (mem) wake-up.
+-- The 'exec' field is a function(address) that performs the reconnect.
+-- All strategies run asynchronously via ffiutil.runInSubProcess so they
+-- never block the UIManager loop.
+--
+-- Strategy overview:
+--   1. direct_connect      – plain Device1.Connect via D-Bus (fastest, lowest risk)
+--   2. trust_connect       – set Trusted=true first, then Connect
+--                            (helps if bluez dropped trust across suspend)
+--   3. adapter_cycle       – power HCI adapter OFF→wait→ON, then Connect
+--                            (resets adapter state without restarting daemon)
+--   4. bluedroid_restart   – full MTK BluedroidManager1.Off→On, then Connect
+--                            (restarts the MTK BT daemon stack; heavier but
+--                             fixes cases where daemon state is stale after wake)
+--   5. wmt_reload          – kill wmt_launcher/wmt_loader, restart them, then
+--                            BluedroidManager1.On + Connect
+--                            (reloads WMT coexistence firmware from disk;
+--                             most aggressive, use if adapter_cycle still fails)
+--   6. manual              – never auto-reconnect; user triggers from menu
 
---- Delay in seconds before first reconnect attempt on resume
+local DBUS_DEST_RAW = "com.kobo.mtk.bluedroid"  -- used inside subprocess lambdas
+
+local function _dbusExec(cmd)
+    return os.execute(cmd .. " >/dev/null 2>&1") == 0
+end
+
+--- Helper: run inside a subprocess (already in child context)
+local function _subBtOn()
+    _dbusExec("dbus-send --system --print-reply --dest=" .. DBUS_DEST_RAW
+        .. " / com.kobo.bluetooth.BluedroidManager1.On")
+    _dbusExec("dbus-send --system --print-reply --dest=" .. DBUS_DEST_RAW
+        .. " /org/bluez/hci0"
+        .. " org.freedesktop.DBus.Properties.Set"
+        .. " string:org.bluez.Adapter1 string:Powered variant:boolean:true")
+end
+
+local function _subDevConnect(dev_path)
+    _dbusExec("dbus-send --system --print-reply --dest=" .. DBUS_DEST_RAW
+        .. " " .. dev_path .. " org.bluez.Device1.Connect")
+end
+
+local function _subSetTrusted(dev_path)
+    _dbusExec("dbus-send --system --print-reply --dest=" .. DBUS_DEST_RAW
+        .. " " .. dev_path
+        .. " org.freedesktop.DBus.Properties.Set"
+        .. " string:org.bluez.Device1 string:Trusted variant:boolean:true")
+end
+
+local function _subAdapterPower(on)
+    local val = on and "true" or "false"
+    _dbusExec("dbus-send --system --print-reply --dest=" .. DBUS_DEST_RAW
+        .. " /org/bluez/hci0"
+        .. " org.freedesktop.DBus.Properties.Set"
+        .. " string:org.bluez.Adapter1 string:Powered variant:boolean:" .. val)
+end
+
+local function _subBluedroidOff()
+    _dbusExec("dbus-send --system --print-reply --dest=" .. DBUS_DEST_RAW
+        .. " /org/bluez/hci0"
+        .. " org.freedesktop.DBus.Properties.Set"
+        .. " string:org.bluez.Adapter1 string:Powered variant:boolean:false")
+    _dbusExec("dbus-send --system --print-reply --dest=" .. DBUS_DEST_RAW
+        .. " / com.kobo.bluetooth.BluedroidManager1.Off")
+end
+
 local RECONNECT_STRATEGIES = {
     {
-        id    = "immediate",
-        label = _("Immediately (0 s delay)"),
+        id    = "direct_connect",
+        label = _("1. Direct connect  (Device1.Connect)"),
+        desc  = _("Calls org.bluez.Device1.Connect directly.\nFastest, safest — try this first."),
+        delay = 1,   -- seconds to wait after BT-ON before attempting
+        exec  = function(address)
+            -- runs INSIDE subprocess
+            local dev_path = "/org/bluez/hci0/dev_" .. address:gsub(":", "_")
+            _subDevConnect(dev_path)
+        end,
+    },
+    {
+        id    = "trust_connect",
+        label = _("2. Trust + connect  (set Trusted=true, then Connect)"),
+        desc  = _("Sets Trusted=true on the device first, then connects.\n"
+               .. "Helps if bluez dropped trust across suspend."),
+        delay = 1,
+        exec  = function(address)
+            local dev_path = "/org/bluez/hci0/dev_" .. address:gsub(":", "_")
+            _subSetTrusted(dev_path)
+            ffiutil.sleep(0.3)
+            _subDevConnect(dev_path)
+        end,
+    },
+    {
+        id    = "adapter_cycle",
+        label = _("3. Adapter cycle  (HCI power OFF → ON → Connect)"),
+        desc  = _("Powers the HCI adapter off, waits 1 s, powers it on again,\n"
+               .. "then connects. Resets adapter state without restarting daemon.\n"
+               .. "Good when bluez thinks the adapter is still in a bad state."),
         delay = 0,
+        exec  = function(address)
+            local dev_path = "/org/bluez/hci0/dev_" .. address:gsub(":", "_")
+            _subAdapterPower(false)
+            ffiutil.sleep(1)
+            _subAdapterPower(true)
+            ffiutil.sleep(1.5)
+            _subDevConnect(dev_path)
+        end,
     },
     {
-        id    = "short",
-        label = _("Short delay (2 s)"),
-        delay = 2,
+        id    = "bluedroid_restart",
+        label = _("4. Bluedroid restart  (MTK daemon Off → On → Connect)"),
+        desc  = _("Calls BluedroidManager1.Off then .On (restarts MTK BT daemon),\n"
+               .. "then connects. Heavier than adapter_cycle but fixes stale\n"
+               .. "daemon state after wake-up."),
+        delay = 0,
+        exec  = function(address)
+            local dev_path = "/org/bluez/hci0/dev_" .. address:gsub(":", "_")
+            _subBluedroidOff()
+            ffiutil.sleep(2)
+            _subBtOn()
+            ffiutil.sleep(2)
+            _subDevConnect(dev_path)
+        end,
     },
     {
-        id    = "medium",
-        label = _("Medium delay (5 s)"),
-        delay = 5,
-    },
-    {
-        id    = "long",
-        label = _("Long delay (10 s)"),
-        delay = 10,
+        id    = "wmt_reload",
+        label = _("5. WMT reload  (kill wmt_launcher, restart, then connect)"),
+        desc  = _("Kills wmt_launcher and wmt_loader, restarts them to reload\n"
+               .. "the WMT coexistence firmware from disk, then brings BT up.\n"
+               .. "Most aggressive — use if adapter_cycle still fails after wake.\n"
+               .. "WARNING: briefly disrupts WiFi coexistence firmware."),
+        delay = 0,
+        exec  = function(address)
+            local dev_path = "/org/bluez/hci0/dev_" .. address:gsub(":", "_")
+            -- stop MT stack
+            _subBluedroidOff()
+            ffiutil.sleep(0.5)
+            -- kill WMT userland
+            os.execute("killall -q wmt_launcher wmt_loader 2>/dev/null")
+            ffiutil.sleep(1)
+            -- restart WMT loader (loads firmware WMT_SOC.cfg / WMT_STEP.cfg)
+            os.execute("/usr/bin/wmt_loader >/dev/null 2>&1 &")
+            ffiutil.sleep(0.5)
+            os.execute("/usr/bin/wmt_launcher >/dev/null 2>&1 &")
+            ffiutil.sleep(2)
+            -- bring BT stack back
+            _subBtOn()
+            ffiutil.sleep(2)
+            _subDevConnect(dev_path)
+        end,
     },
     {
         id    = "manual",
-        label = _("Manual only (no auto-reconnect)"),
-        delay = -1,   -- sentinel: never auto-reconnect
+        label = _("6. Manual only  (no auto-reconnect)"),
+        desc  = _("BT is re-enabled on resume but no automatic reconnect.\n"
+               .. "Use 'Reconnect now' from the debug menu."),
+        delay = -1,  -- sentinel: skip reconnect entirely
+        exec  = nil,
     },
 }
 
-local DEFAULT_STRATEGY_ID = "short"
+local DEFAULT_STRATEGY_ID = "direct_connect"
 
 local function strategyById(id)
     for _, s in ipairs(RECONNECT_STRATEGIES) do
         if s.id == id then return s end
     end
-    return RECONNECT_STRATEGIES[2] -- fallback: short
+    return RECONNECT_STRATEGIES[1] -- fallback: direct_connect
 end
 
 -- ── Plugin definition ────────────────────────────────────────────────────────
@@ -333,18 +464,23 @@ function BluetoothPlugin:_cancelReconnectTimer()
     end
 end
 
---- Attempt to reconnect to the last known device.
---- Uses the user-selected reconnect strategy (delay from settings).
+--- Attempt to reconnect to the last known device using the selected strategy.
+--- Each strategy is a different set of D-Bus/syscall operations run in a
+--- subprocess so the UIManager loop is never blocked.
 function BluetoothPlugin:_scheduleReconnect()
     local strategy_id = self:_getSetting("reconnect_strategy", DEFAULT_STRATEGY_ID)
     local strategy    = strategyById(strategy_id)
 
-    if strategy.delay < 0 then
-        logger.dbg("BluetoothPlugin: reconnect strategy = manual, skipping")
+    if strategy.delay < 0 or not strategy.exec then
+        logger.dbg("BluetoothPlugin: reconnect strategy = manual, skipping auto-reconnect")
         return
     end
 
     local last_addr = self:_getSetting("last_connected_address", nil)
+    if not last_addr then
+        logger.dbg("BluetoothPlugin: no last_connected_address, skipping reconnect")
+        return
+    end
 
     self:_cancelReconnectTimer()
 
@@ -354,20 +490,38 @@ function BluetoothPlugin:_scheduleReconnect()
             logger.warn("BluetoothPlugin: BT not enabled at reconnect time, aborting")
             return
         end
-        if not last_addr then
-            logger.dbg("BluetoothPlugin: no last_connected_address, skipping reconnect")
-            return
-        end
-        logger.info("BluetoothPlugin: reconnecting to", last_addr, "strategy=", strategy.id)
-        local ok = btConnect(last_addr)
-        if ok then
-            UIManager:show(InfoMessage:new{
-                text    = _("Bluetooth reconnected."),
-                timeout = 2,
-            })
-        else
-            logger.warn("BluetoothPlugin: reconnect failed for", last_addr)
-        end
+        logger.info("BluetoothPlugin: reconnecting to", last_addr,
+                    "using strategy:", strategy.id)
+        -- Run the strategy's exec function inside a subprocess.
+        -- double_fork=true → child reparented to init, no zombie collection needed.
+        local addr_capture = last_addr
+        local exec_capture = strategy.exec
+        ffiutil.runInSubProcess(function()
+            exec_capture(addr_capture)
+        end, function()
+            -- called back in main process after subprocess exits
+            logger.info("BluetoothPlugin: reconnect subprocess finished, strategy=", strategy.id)
+            -- We cannot know if it succeeded from here without polling.
+            -- A follow-up poll checks Connected property.
+            UIManager:scheduleIn(0.5, function()
+                local devices = btGetDevices()
+                local connected = false
+                for _, d in ipairs(devices) do
+                    if d.address:lower() == addr_capture:lower() and d.connected then
+                        connected = true
+                        break
+                    end
+                end
+                if connected then
+                    UIManager:show(InfoMessage:new{
+                        text    = _("Bluetooth reconnected."),
+                        timeout = 2,
+                    })
+                else
+                    logger.warn("BluetoothPlugin: reconnect verify failed for", addr_capture)
+                end
+            end)
+        end, true)
     end
 
     if strategy.delay == 0 then
@@ -713,34 +867,52 @@ end
 function BluetoothPlugin:_buildDebugMenu()
     local items = {}
 
-    -- Reconnect strategy chooser
+    -- ── Strategy chooser sub-menu ────────────────────────────────────────
+    -- Each entry shows the strategy label plus a brief description of
+    -- which D-Bus / syscalls it uses, so the user can make an informed choice.
     local strategy_items = {}
     for _, s in ipairs(RECONNECT_STRATEGIES) do
-        local sid = s.id  -- capture
+        local sid   = s.id    -- capture
+        local slabel = s.label
+        local sdesc  = s.desc or ""
         table.insert(strategy_items, {
-            text = s.label,
+            text = slabel,
             checked_func = function()
                 return self:_getSetting("reconnect_strategy", DEFAULT_STRATEGY_ID) == sid
             end,
             radio = true,
             callback = function()
                 self:_setSetting("reconnect_strategy", sid)
+                -- Show the description so the user knows what they selected
                 UIManager:show(InfoMessage:new{
-                    text    = _("Reconnect strategy set to: ") .. s.label,
-                    timeout = 2,
+                    text    = slabel .. "\n\n" .. sdesc,
+                    timeout = 5,
                 })
             end,
         })
     end
 
     table.insert(items, {
-        text = _("Reconnect strategy (on resume)"),
+        text = _("Reconnect strategy (on resume / startup)"),
         sub_item_table = strategy_items,
     })
 
-    -- Manual reconnect now
+    -- ── Strategy info ────────────────────────────────────────────────────
     table.insert(items, {
-        text = _("Reconnect now (manual)"),
+        text = _("About current strategy…"),
+        callback = function()
+            local sid = self:_getSetting("reconnect_strategy", DEFAULT_STRATEGY_ID)
+            local s   = strategyById(sid)
+            UIManager:show(InfoMessage:new{
+                text    = s.label .. "\n\n" .. (s.desc or _("(no description)")),
+                timeout = 8,
+            })
+        end,
+    })
+
+    -- ── Manual reconnect now using current strategy ──────────────────────
+    table.insert(items, {
+        text = _("Reconnect now (use current strategy)"),
         enabled_func = function() return btIsEnabled() end,
         callback = function()
             local addr = self:_getSetting("last_connected_address")
@@ -751,47 +923,79 @@ function BluetoothPlugin:_buildDebugMenu()
                 })
                 return
             end
-            UIManager:show(InfoMessage:new{
-                text    = _("Reconnecting…"),
-                timeout = 1,
-            })
-            UIManager:tickAfterNext(function()
-                local ok = btConnect(addr)
+            local sid = self:_getSetting("reconnect_strategy", DEFAULT_STRATEGY_ID)
+            local s   = strategyById(sid)
+            if not s.exec then
                 UIManager:show(InfoMessage:new{
-                    text    = ok and _("Reconnected!") or _("Reconnect failed."),
-                    timeout = 2,
+                    text    = _("Strategy 'manual' selected — no auto-reconnect.\nChange strategy first."),
+                    timeout = 3,
                 })
+                return
+            end
+            local name = self:_getSetting("last_connected_name") or addr
+            UIManager:show(InfoMessage:new{
+                text    = _("Reconnecting to ") .. name .. "\n" .. _("Strategy: ") .. s.label,
+                timeout = 2,
+            })
+            local addr_c = addr
+            local exec_c = s.exec
+            UIManager:tickAfterNext(function()
+                ffiutil.runInSubProcess(function()
+                    exec_c(addr_c)
+                end, function()
+                    UIManager:scheduleIn(0.5, function()
+                        local devices = btGetDevices()
+                        local connected = false
+                        for _, d in ipairs(devices) do
+                            if d.address:lower() == addr_c:lower() and d.connected then
+                                connected = true; break
+                            end
+                        end
+                        UIManager:show(InfoMessage:new{
+                            text    = connected and _("Reconnected!") or _("Reconnect failed."),
+                            timeout = 3,
+                        })
+                    end)
+                end, true)
             end)
         end,
     })
 
-    -- Status dump
+    -- ── Status dump ──────────────────────────────────────────────────────
     table.insert(items, {
-        text = _("Show BT status (debug)"),
+        text = _("Show BT status (debug info)"),
         callback = function()
-            local on   = btIsEnabled()
-            local addr = self:_getSetting("last_connected_address") or "—"
-            local name = self:_getSetting("last_connected_name")    or "—"
-            local strat = self:_getSetting("reconnect_strategy", DEFAULT_STRATEGY_ID)
+            local on    = btIsEnabled()
+            local addr  = self:_getSetting("last_connected_address") or "—"
+            local name  = self:_getSetting("last_connected_name")    or "—"
+            local sid   = self:_getSetting("reconnect_strategy", DEFAULT_STRATEGY_ID)
+            local s     = strategyById(sid)
             local was   = self.bt_was_on_before_suspend and "yes" or "no"
-            local sp    = self.standby_prevented and "yes" or "no"
+            local sp    = self.standby_prevented        and "yes" or "no"
+            local wifi  = NetworkMgr:isWifiOn()         and "ON"  or "OFF"
             UIManager:show(InfoMessage:new{
                 text = string.format(
-                    "BT: %s\nStandby prevented: %s\nWas on at suspend: %s\n"
-                    .. "Reconnect strategy: %s\nLast device: %s (%s)",
-                    on and "ON" or "OFF", sp, was, strat, name, addr
+                    "BT adapter  : %s\n"
+                    .. "Standby blocked: %s\n"
+                    .. "Was on at suspend: %s\n"
+                    .. "WiFi now    : %s\n"
+                    .. "Last device : %s\n"
+                    .. "            (%s)\n"
+                    .. "Strategy    : %s",
+                    on and "ON" or "OFF", sp, was, wifi, name, addr, s.label
                 ),
-                timeout = 8,
+                timeout = 10,
             })
         end,
     })
 
-    -- Force BT off (emergency)
+    -- ── Force BT off (emergency) ─────────────────────────────────────────
     table.insert(items, {
         text = _("Force BT OFF (emergency)"),
         callback = function()
             UIManager:show(ConfirmBox:new{
-                text    = _("Force-disable Bluetooth immediately?"),
+                text    = _("Force-disable Bluetooth immediately?\n"
+                          .. "This runs BluedroidManager1.Off and allows standby."),
                 ok_text = _("Force OFF"),
                 ok_callback = function()
                     btTurnOff()
