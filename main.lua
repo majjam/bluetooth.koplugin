@@ -32,17 +32,18 @@ if not (Device:isKobo() and Device.isMTK and Device.isMTK()) then
     return { disabled = true }
 end
 
-local ConfirmBox   = require("ui/widget/confirmbox")
-local DataStorage  = require("datastorage")
-local InfoMessage  = require("ui/widget/infomessage")
-local LuaSettings  = require("luasettings")
-local Menu         = require("ui/widget/menu")
-local NetworkMgr   = require("ui/network/manager")
-local UIManager    = require("ui/uimanager")
+local ConfirmBox      = require("ui/widget/confirmbox")
+local DataStorage     = require("datastorage")
+local InfoMessage     = require("ui/widget/infomessage")
+local LuaSettings     = require("luasettings")
+local Menu            = require("ui/widget/menu")
+local NetworkMgr      = require("ui/network/manager")
+local Screen          = require("device/screen")
+local UIManager       = require("ui/uimanager")
 local WidgetContainer = require("ui/widget/container/widgetcontainer")
-local ffiutil      = require("ffi/util")
-local logger       = require("logger")
-local _            = require("gettext")
+local ffiutil         = require("ffi/util")
+local logger          = require("logger")
+local _               = require("gettext")
 
 -- ── D-Bus helpers (MTK adapter directly) ────────────────────────────────────
 
@@ -159,30 +160,31 @@ end
 --                            (reloads WMT coexistence firmware from disk;
 --                             most aggressive, use if adapter_cycle still fails)
 --   6. manual              – never auto-reconnect; user triggers from menu
-
-local DBUS_DEST_RAW = "com.kobo.mtk.bluedroid"  -- used inside subprocess lambdas
+--
+-- Note: DBUS_DEST is reused inside subprocess lambdas; Lua closures capture it
+-- correctly because all strategy exec functions are defined in the same file scope.
 
 local function _dbusExec(cmd)
     return os.execute(cmd .. " >/dev/null 2>&1") == 0
 end
 
---- Helper: run inside a subprocess (already in child context)
+--- Helpers used inside subprocess lambdas (file-scope, captured by closures)
 local function _subBtOn()
-    _dbusExec("dbus-send --system --print-reply --dest=" .. DBUS_DEST_RAW
+    _dbusExec("dbus-send --system --print-reply --dest=" .. DBUS_DEST
         .. " / com.kobo.bluetooth.BluedroidManager1.On")
-    _dbusExec("dbus-send --system --print-reply --dest=" .. DBUS_DEST_RAW
+    _dbusExec("dbus-send --system --print-reply --dest=" .. DBUS_DEST
         .. " /org/bluez/hci0"
         .. " org.freedesktop.DBus.Properties.Set"
         .. " string:org.bluez.Adapter1 string:Powered variant:boolean:true")
 end
 
 local function _subDevConnect(dev_path)
-    _dbusExec("dbus-send --system --print-reply --dest=" .. DBUS_DEST_RAW
+    _dbusExec("dbus-send --system --print-reply --dest=" .. DBUS_DEST
         .. " " .. dev_path .. " org.bluez.Device1.Connect")
 end
 
 local function _subSetTrusted(dev_path)
-    _dbusExec("dbus-send --system --print-reply --dest=" .. DBUS_DEST_RAW
+    _dbusExec("dbus-send --system --print-reply --dest=" .. DBUS_DEST
         .. " " .. dev_path
         .. " org.freedesktop.DBus.Properties.Set"
         .. " string:org.bluez.Device1 string:Trusted variant:boolean:true")
@@ -190,18 +192,18 @@ end
 
 local function _subAdapterPower(on)
     local val = on and "true" or "false"
-    _dbusExec("dbus-send --system --print-reply --dest=" .. DBUS_DEST_RAW
+    _dbusExec("dbus-send --system --print-reply --dest=" .. DBUS_DEST
         .. " /org/bluez/hci0"
         .. " org.freedesktop.DBus.Properties.Set"
         .. " string:org.bluez.Adapter1 string:Powered variant:boolean:" .. val)
 end
 
 local function _subBluedroidOff()
-    _dbusExec("dbus-send --system --print-reply --dest=" .. DBUS_DEST_RAW
+    _dbusExec("dbus-send --system --print-reply --dest=" .. DBUS_DEST
         .. " /org/bluez/hci0"
         .. " org.freedesktop.DBus.Properties.Set"
         .. " string:org.bluez.Adapter1 string:Powered variant:boolean:false")
-    _dbusExec("dbus-send --system --print-reply --dest=" .. DBUS_DEST_RAW
+    _dbusExec("dbus-send --system --print-reply --dest=" .. DBUS_DEST
         .. " / com.kobo.bluetooth.BluedroidManager1.Off")
 end
 
@@ -315,9 +317,10 @@ local BluetoothPlugin = WidgetContainer:extend{
     is_doc_only     = false,
 
     -- runtime state
-    bt_was_on_before_suspend = false,
-    wifi_was_on_snapshot     = false,
-    standby_prevented        = false,
+    bt_was_on_before_suspend = false,   -- saved in onSuspend, used in onResume
+    wifi_was_on_snapshot     = false,   -- WiFi state before BT enable
+    standby_prevented        = false,   -- tracks UIManager:preventStandby calls
+    bt_enable_pending        = false,   -- true while async _enableBT is in flight
     reconnect_timer          = nil,     -- scheduled UIManager task handle
     scan_devices             = nil,     -- last scan result cache
 }
@@ -391,6 +394,7 @@ end
 -- ── Core BT operations (async-friendly) ─────────────────────────────────────
 
 --- Enable BT in a subprocess, poll until up, then restore WiFi.
+--- Sets bt_enable_pending=true for the duration so onSuspend can abort safely.
 --- @param is_resume boolean   true when called from onResume
 --- @param on_done   function  optional callback after BT confirmed ON
 function BluetoothPlugin:_enableBT(is_resume, on_done)
@@ -402,6 +406,7 @@ function BluetoothPlugin:_enableBT(is_resume, on_done)
 
     self:_snapshotWifi()
     self:_preventStandby()
+    self.bt_enable_pending = true
 
     -- MTK BT needs WiFi stack up for coexistence firmware init
     if not NetworkMgr:isWifiOn() then
@@ -414,15 +419,22 @@ function BluetoothPlugin:_enableBT(is_resume, on_done)
             btTurnOn()
         end, false, true)
 
-        -- Poll until enabled (max 3 seconds, 100 ms intervals)
+        -- Poll until enabled (max 3 s, 100 ms intervals)
         local function poll(n)
+            -- Abort gracefully if a suspend arrived while we were enabling
+            if not self.bt_enable_pending then
+                logger.info("BluetoothPlugin: enable aborted (suspend arrived)")
+                return
+            end
             if btIsEnabled() then
+                self.bt_enable_pending = false
                 logger.info("BluetoothPlugin: BT enabled")
                 self:_restoreWifi(is_resume)
                 if on_done then on_done() end
                 return
             end
             if n >= 30 then
+                self.bt_enable_pending = false
                 logger.warn("BluetoothPlugin: BT enable timeout")
                 self:_allowStandby()
                 self:_restoreWifi(is_resume)
@@ -556,8 +568,13 @@ function BluetoothPlugin:init()
 end
 
 function BluetoothPlugin:onSuspend()
-    -- Called by KOReader BEFORE writing /sys/power/state = mem
+    -- Called by KOReader BEFORE writing /sys/power/state = mem.
+    -- MTK rule: DO NOT suspend while BT or any async enable is in flight.
     logger.dbg("BluetoothPlugin: onSuspend")
+
+    -- Abort any in-flight async enable so its poll loop exits cleanly
+    self.bt_enable_pending = false
+
     self.bt_was_on_before_suspend = btIsEnabled()
     self:_cancelReconnectTimer()
 
@@ -565,7 +582,7 @@ function BluetoothPlugin:onSuspend()
         logger.info("BluetoothPlugin: BT on → turning off before deep sleep")
         self:_disableBT(false)
     end
-    -- standby already released by _disableBT; if it was already off, just ensure:
+    -- _disableBT already calls _allowStandby; guard the else-path too:
     self:_allowStandby()
 end
 
@@ -598,7 +615,6 @@ function BluetoothPlugin:addToMainMenu(menu_items)
 end
 
 function BluetoothPlugin:_buildMenu()
-    local enabled = btIsEnabled()
     return {
         -- ── Toggle ───────────────────────────────────────────────────
         {
@@ -658,12 +674,13 @@ function BluetoothPlugin:_buildMenu()
         -- ── Settings sub-menu ────────────────────────────────────────
         {
             text = _("Bluetooth settings"),
-            sub_item_table = self:_buildSettingsMenu(),
+            -- sub_item_table_func rebuilds on each open so checked_func stays fresh
+            sub_item_table_func = function() return self:_buildSettingsMenu() end,
         },
         -- ── Debug sub-menu ────────────────────────────────────────────
         {
             text = _("Debug / reconnect strategy"),
-            sub_item_table = self:_buildDebugMenu(),
+            sub_item_table_func = function() return self:_buildDebugMenu() end,
         },
     }
 end
@@ -676,32 +693,21 @@ function BluetoothPlugin:_doScan()
         timeout = 1,
     })
 
-    -- Scan in subprocess so UI stays responsive
-    local scan_done = false
+    -- Discovery runs in a subprocess (StartDiscovery blocks for 10 s).
+    -- double_fork=true so the child is reparented to init automatically.
+    -- The completion callback fires in the main process once the child exits,
+    -- then we read the device list via GetManagedObjects.
     ffiutil.runInSubProcess(function()
+        -- child: start discovery, wait 10 s, stop
         btStartScan()
         ffiutil.sleep(10)
         btStopScan()
     end, function()
-        -- sub-process finished callback (called in main process)
-        scan_done = true
-    end, true)
-
-    -- poll for scan completion, then show results
-    local function poll_scan(n)
-        if scan_done or n >= 120 then -- max 12 s
-            local devices = btGetDevices()
-            self.scan_devices = devices
-            self:_showScanResults(devices)
-            return
-        end
-        UIManager:scheduleIn(0.1, function() poll_scan(n + 1) end)
-    end
-    UIManager:scheduleIn(10.2, function()
+        -- main process: subprocess finished → read and display results
         local devices = btGetDevices()
         self.scan_devices = devices
         self:_showScanResults(devices)
-    end)
+    end, true)
 end
 
 function BluetoothPlugin:_showScanResults(devices)
